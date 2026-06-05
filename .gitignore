@@ -1,0 +1,17 @@
+# Editor / IDE
+*.swp
+*.swo
+*~
+.idea/
+.vscode/
+
+# OS cruft
+.DS_Store
+Thumbs.db
+
+# Backups
+*.bak
+*.orig
+
+# Claude Code machine-local settings
+.claude/settings.local.json

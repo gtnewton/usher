@@ -1,0 +1,303 @@
+#!/usr/bin/env bash
+#
+# caddyup — quick local HTTPS dev server backed by Caddy, with optional
+#             PHP-FPM support. All working files live in a private mktemp
+#             directory; nothing is ever written into the folder being served.
+#
+# Usage:
+#   caddyup [DIR]               Serve DIR (defaults to the configured root).
+#   caddyup --pick              Pick a folder graphically, then serve it.
+#   caddyup --set-default [DIR] Set the default root (graphical picker if no DIR).
+#   caddyup --stop              Stop a server started in the background.
+#   caddyup --status            Report whether a background server is running.
+#   caddyup -h | --help         Show this help.
+#
+# Settings live in ~/.config/caddyup/config (DEFAULT_ROOT, PORT). Certificates
+# live in ~/.local/share/caddyup/ (cert.pem, key.pem); without them Caddy
+# falls back to its own internal CA.
+
+set -euo pipefail
+
+# ── Paths & defaults ─────────────────────────────────────────────────────────
+
+# In-script fallback default root. The installer and --set-default normally
+# persist this to the config file below, which overrides this line.
+DEFAULT_ROOT=""
+
+PORT="${PORT:-8443}"
+
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/caddyup"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/caddyup"
+CONFIG_FILE="${CONFIG_DIR}/config"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/caddyup"
+PID_FILE="${RUN_DIR}/caddyup.pid"
+
+CERT_FILE="${DATA_DIR}/cert.pem"
+KEY_FILE="${DATA_DIR}/key.pem"
+
+# Persisted settings may override DEFAULT_ROOT, PORT, CERT_FILE, KEY_FILE.
+# shellcheck source=/dev/null
+[[ -f "$CONFIG_FILE" ]] && source "$CONFIG_FILE"
+
+# State referenced by the cleanup trap; populated once a server starts.
+WORK_DIR=""
+CADDY_PID=""
+PHP_PID_FILE=""
+
+# ── Helpers ──────────────────────────────────────────────────────────────────
+
+usage() {
+    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+}
+
+notify() {
+    # Desktop notification when available (for background/GUI use); always echo.
+    local title="$1" body="${2:-}"
+    if command -v notify-send >/dev/null 2>&1; then
+        notify-send -a caddyup "$title" "$body" 2>/dev/null || true
+    fi
+    echo "${title}${body:+: $body}"
+}
+
+# Persist a key=value pair to the config file, replacing any existing entry.
+update_config() {
+    local key="$1" val="$2"
+    mkdir -p "$CONFIG_DIR"
+    touch "$CONFIG_FILE"
+    if grep -q "^${key}=" "$CONFIG_FILE"; then
+        sed -i "s|^${key}=.*|${key}=\"${val}\"|" "$CONFIG_FILE"
+    else
+        printf '%s="%s"\n' "$key" "$val" >> "$CONFIG_FILE"
+    fi
+}
+
+# Graphical directory picker; prints the chosen path or returns non-zero.
+pick_dir() {
+    local title="${1:-caddyup — choose a folder to serve}"
+    if command -v zenity >/dev/null 2>&1; then
+        zenity --file-selection --directory --title="$title" 2>/dev/null
+    else
+        local dir
+        read -rp "Folder: " dir
+        [[ -n "$dir" ]] && printf '%s\n' "${dir/#\~/$HOME}"
+    fi
+}
+
+set_default() {
+    local dir="${1:-}"
+    [[ -z "$dir" ]] && dir="$(pick_dir 'caddyup — choose default folder to serve')" || true
+    dir="${dir/#\~/$HOME}"
+    if [[ -z "$dir" ]]; then
+        echo "No folder given; default unchanged."
+        exit 1
+    fi
+    if [[ ! -d "$dir" ]]; then
+        notify "caddyup" "Not a directory: $dir"
+        exit 1
+    fi
+    update_config DEFAULT_ROOT "$dir"
+    notify "caddyup default set" "$dir"
+}
+
+is_running() {
+    [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+}
+
+stop_server() {
+    if is_running; then
+        kill "$(cat "$PID_FILE")" 2>/dev/null || true
+        notify "caddyup stopped"
+    else
+        echo "No running background server found."
+        rm -f "$PID_FILE"
+    fi
+}
+
+status() {
+    if is_running; then
+        echo "caddyup is running (PID $(cat "$PID_FILE")) on https://127.0.0.1:${PORT}"
+    else
+        echo "caddyup is not running."
+    fi
+}
+
+cleanup() {
+    [[ -n "$CADDY_PID" ]] && kill "$CADDY_PID" 2>/dev/null || true
+    [[ -n "$PHP_PID_FILE" && -f "$PHP_PID_FILE" ]] && kill "$(cat "$PHP_PID_FILE")" 2>/dev/null || true
+    [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
+    rm -f "$PID_FILE"
+}
+
+# ── Core: serve a directory ──────────────────────────────────────────────────
+
+serve() {
+    local root="${1/#\~/$HOME}"
+
+    if [[ ! -d "$root" ]]; then
+        notify "caddyup" "Not a directory: $root"
+        exit 1
+    fi
+    if is_running; then
+        notify "caddyup already running" "Stop it first: caddyup --stop"
+        exit 1
+    fi
+    if ! command -v caddy >/dev/null 2>&1; then
+        notify "caddyup" "Caddy is not installed."
+        exit 1
+    fi
+
+    # Private working directory; cleaned up on exit. Nothing lands in $root.
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/caddyup.XXXXXX")"
+    local php_sock="${WORK_DIR}/php-fpm.sock"
+    local php_conf="${WORK_DIR}/php-fpm.conf"
+    local php_log="${WORK_DIR}/php-fpm.log"
+    local caddyfile="${WORK_DIR}/Caddyfile"
+    PHP_PID_FILE="${WORK_DIR}/php-fpm.pid"
+
+    trap cleanup EXIT
+    trap 'exit 130' INT
+    trap 'exit 143' TERM
+
+    # ── Optional PHP-FPM ──────────────────────────────────────────────────────
+    local php_enabled=false php_fpm_bin=""
+    if command -v php >/dev/null 2>&1; then
+        local php_ver
+        php_ver="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
+        if command -v "php-fpm${php_ver}" >/dev/null 2>&1; then
+            php_fpm_bin="php-fpm${php_ver}"
+        elif command -v php-fpm >/dev/null 2>&1; then
+            php_fpm_bin="php-fpm"
+        fi
+    fi
+
+    if [[ -n "$php_fpm_bin" ]]; then
+        cat > "$php_conf" <<EOF
+[global]
+pid = ${PHP_PID_FILE}
+error_log = ${php_log}
+daemonize = yes
+
+[www]
+listen = ${php_sock}
+pm = static
+pm.max_children = 2
+EOF
+        echo "Starting ${php_fpm_bin}..."
+        if "$php_fpm_bin" -y "$php_conf"; then
+            php_enabled=true
+        else
+            echo "Warning: ${php_fpm_bin} failed to start; serving static files only." >&2
+        fi
+    else
+        echo "Note: no PHP-FPM found; serving static files only."
+    fi
+
+    # ── TLS ───────────────────────────────────────────────────────────────────
+    local tls_config
+    if [[ -f "$CERT_FILE" && -f "$KEY_FILE" ]]; then
+        tls_config="tls \"${CERT_FILE}\" \"${KEY_FILE}\""
+    else
+        tls_config="tls internal"
+        echo "Note: no certificate at ${CERT_FILE}; using Caddy's internal CA."
+    fi
+
+    # ── Log format (pretty via jq when available) ─────────────────────────────
+    local log_format
+    if command -v jq >/dev/null 2>&1; then
+        log_format="json"
+    else
+        log_format="filter {
+            wrap console
+            fields {
+                request>headers delete
+                request>tls delete
+                resp_headers delete
+            }
+        }"
+        echo "Note: install 'jq' for cleaner access logs (sudo apt install jq)."
+    fi
+
+    # ── PHP route block (only when PHP-FPM is up) ─────────────────────────────
+    local php_block=""
+    if [[ "$php_enabled" == true ]]; then
+        php_block="
+    try_files {path} {path}/index.php index.php
+
+    @phpFiles path *.php
+    handle @phpFiles {
+        php_fastcgi unix/${php_sock}
+    }
+"
+    fi
+
+    # ── Caddyfile ─────────────────────────────────────────────────────────────
+    cat > "$caddyfile" <<EOF
+{
+    auto_https disable_redirects
+    admin off
+}
+
+https://127.0.0.1:${PORT} {
+    ${tls_config}
+    root * "${root}"
+
+    log {
+        output stdout
+        format ${log_format}
+    }
+${php_block}
+    file_server
+
+    header {
+        Access-Control-Allow-Origin *
+        Access-Control-Allow-Methods "GET, POST, OPTIONS"
+        Access-Control-Allow-Headers *
+    }
+
+    @options method OPTIONS
+    respond @options 204
+}
+EOF
+
+    # ── Launch Caddy in the background so signals reach the trap cleanly ───────
+    notify "caddyup" "Serving ${root} at https://127.0.0.1:${PORT}"
+    if command -v jq >/dev/null 2>&1; then
+        caddy run --config "$caddyfile" --adapter caddyfile \
+            > >(jq --unbuffered -r '"[\(.ts | todate)] [36m[\(.request.method)][0m \(.request.uri)  [[32m\(.status)[0m]"' 2>/dev/null) &
+    else
+        caddy run --config "$caddyfile" --adapter caddyfile &
+    fi
+    CADDY_PID=$!
+    mkdir -p "$RUN_DIR"
+    echo "$$" > "$PID_FILE"
+    wait "$CADDY_PID"
+}
+
+# ── Entry point ──────────────────────────────────────────────────────────────
+
+main() {
+    local root
+    case "${1:-}" in
+        -h|--help)     usage; exit 0 ;;
+        --stop)        stop_server; exit 0 ;;
+        --status)      status; exit 0 ;;
+        --set-default) set_default "${2:-}"; exit 0 ;;
+        --pick)        root="$(pick_dir)" || exit 0; [[ -z "$root" ]] && exit 0 ;;
+        -*)            echo "caddyup: unknown option: $1" >&2; usage; exit 1 ;;
+        "")
+            if [[ -n "${DEFAULT_ROOT:-}" ]]; then
+                root="$DEFAULT_ROOT"
+            elif [[ -t 1 ]]; then
+                root="$PWD"
+            else
+                # GUI launch with no default configured: ask for a folder.
+                root="$(pick_dir)" || exit 0
+                [[ -z "$root" ]] && exit 0
+            fi
+            ;;
+        *)             root="$1" ;;
+    esac
+    serve "$root"
+}
+
+main "$@"

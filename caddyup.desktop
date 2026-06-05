@@ -1,0 +1,24 @@
+[Desktop Entry]
+Version=1.0
+Name=Caddy Up
+GenericName=Local HTTPS dev server
+Comment=Serve the default folder over HTTPS (Caddy + PHP) in the background
+Exec=caddyup
+Terminal=false
+Type=Application
+Categories=Development;WebDevelopment;
+Icon=caddyup
+StartupNotify=false
+Actions=serve-folder;set-default;stop;
+
+[Desktop Action serve-folder]
+Name=Serve a folder…
+Exec=caddyup --pick
+
+[Desktop Action set-default]
+Name=Set default folder…
+Exec=caddyup --set-default
+
+[Desktop Action stop]
+Name=Stop server
+Exec=caddyup --stop
