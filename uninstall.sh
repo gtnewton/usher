@@ -1,23 +1,25 @@
 #!/usr/bin/env bash
 #
-# uninstall.sh — remove caddyup for the current user.
+# uninstall.sh — remove usher for the current user.
 
 set -euo pipefail
 
-BIN_FILE="${HOME}/.local/bin/caddyup"
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/caddyup"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/caddyup"
-DESKTOP_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/applications/caddyup.desktop"
-ICON_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/caddyup.svg"
+BIN_FILE="${HOME}/.local/bin/usher"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/usher"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/usher"
+DESKTOP_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/applications/usher.desktop"
+ICON_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor/scalable/apps/usher.svg"
+COMPLETION_FILE="${XDG_DATA_HOME:-$HOME/.local/share}/bash-completion/completions/usher"
 
-echo "Removing caddyup..."
+echo "Removing usher..."
 
 # Stop a running background server, if any.
 [[ -x "$BIN_FILE" ]] && "$BIN_FILE" --stop >/dev/null 2>&1 || true
 
-[[ -f "$BIN_FILE" ]]     && rm "$BIN_FILE"     && echo "Removed $BIN_FILE"
-[[ -f "$DESKTOP_FILE" ]] && rm "$DESKTOP_FILE" && echo "Removed $DESKTOP_FILE"
-[[ -f "$ICON_FILE" ]]    && rm "$ICON_FILE"    && echo "Removed $ICON_FILE"
+[[ -f "$BIN_FILE" ]]        && rm "$BIN_FILE"        && echo "Removed $BIN_FILE"
+[[ -f "$DESKTOP_FILE" ]]   && rm "$DESKTOP_FILE"   && echo "Removed $DESKTOP_FILE"
+[[ -f "$ICON_FILE" ]]      && rm "$ICON_FILE"      && echo "Removed $ICON_FILE"
+[[ -f "$COMPLETION_FILE" ]] && rm "$COMPLETION_FILE" && echo "Removed $COMPLETION_FILE"
 
 update-desktop-database "${XDG_DATA_HOME:-$HOME/.local/share}/applications" 2>/dev/null || true
 gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true

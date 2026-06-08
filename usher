@@ -1,19 +1,25 @@
 #!/usr/bin/env bash
 #
-# caddyup — quick local HTTPS dev server backed by Caddy, with optional
+# usher — quick local HTTPS dev server backed by Caddy, with optional
 #             PHP-FPM support. All working files live in a private mktemp
 #             directory; nothing is ever written into the folder being served.
 #
 # Usage:
-#   caddyup [DIR]               Serve DIR (defaults to the configured root).
-#   caddyup --pick              Pick a folder graphically, then serve it.
-#   caddyup --set-default [DIR] Set the default root (graphical picker if no DIR).
-#   caddyup --stop              Stop a server started in the background.
-#   caddyup --status            Report whether a background server is running.
-#   caddyup -h | --help         Show this help.
+#   usher [DIR]                  Serve DIR (defaults to the configured root).
+#   usher NAME                   Serve the directory saved under bookmark NAME.
+#   usher --pick                 Pick a folder graphically, then serve it.
+#   usher --set-default [DIR]    Set the default root (graphical picker if no DIR).
+#   usher --bookmark NAME [DIR]  Save a bookmark (graphical picker if no DIR).
+#   usher --unbookmark NAME      Remove a bookmark.
+#   usher --bookmarks            List all bookmarks.
+#   usher --stop                 Stop a server started in the background.
+#   usher --status               Report whether a background server is running.
+#   usher -h | --help            Show this help.
 #
-# Settings live in ~/.config/caddyup/config (DEFAULT_ROOT, PORT). Certificates
-# live in ~/.local/share/caddyup/ (cert.pem, key.pem); without them Caddy
+# To serve a local subdirectory that shares a name with a bookmark, use ./name.
+#
+# Settings live in ~/.config/usher/config (DEFAULT_ROOT, PORT). Certificates
+# live in ~/.local/share/usher/ (cert.pem, key.pem); without them Caddy
 # falls back to its own internal CA.
 
 set -euo pipefail
@@ -26,11 +32,12 @@ DEFAULT_ROOT=""
 
 PORT="${PORT:-8443}"
 
-DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/caddyup"
-CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/caddyup"
+DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/usher"
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/usher"
 CONFIG_FILE="${CONFIG_DIR}/config"
-RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/caddyup"
-PID_FILE="${RUN_DIR}/caddyup.pid"
+BOOKMARKS_FILE="${CONFIG_DIR}/bookmarks"
+RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/usher"
+PID_FILE="${RUN_DIR}/usher.pid"
 
 CERT_FILE="${DATA_DIR}/cert.pem"
 KEY_FILE="${DATA_DIR}/key.pem"
@@ -47,14 +54,14 @@ PHP_PID_FILE=""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 usage() {
-    sed -n '3,18p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 notify() {
     # Desktop notification when available (for background/GUI use); always echo.
     local title="$1" body="${2:-}"
     if command -v notify-send >/dev/null 2>&1; then
-        notify-send -a caddyup "$title" "$body" 2>/dev/null || true
+        notify-send -a usher "$title" "$body" 2>/dev/null || true
     fi
     echo "${title}${body:+: $body}"
 }
@@ -71,9 +78,70 @@ update_config() {
     fi
 }
 
+# Look up a bookmark by name; prints the path and returns 0, or returns 1 if not found.
+lookup_bookmark() {
+    local name="$1" line
+    [[ ! -f "$BOOKMARKS_FILE" ]] && return 1
+    line="$(grep -m1 "^${name}=" "$BOOKMARKS_FILE" 2>/dev/null)" || return 1
+    printf '%s' "${line#*=}"
+}
+
+set_bookmark() {
+    local name="${1:-}" dir="${2:-}"
+    if [[ -z "$name" || ! "$name" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+        echo "usher: bookmark name must contain only letters, digits, hyphens, and underscores." >&2
+        exit 1
+    fi
+    [[ -z "$dir" ]] && dir="$(pick_dir "usher — choose folder for '${name}'")" || true
+    dir="${dir/#\~/$HOME}"
+    if [[ -z "$dir" ]]; then
+        echo "No folder given; bookmark unchanged."
+        exit 1
+    fi
+    if [[ ! -d "$dir" ]]; then
+        notify "usher" "Not a directory: $dir"
+        exit 1
+    fi
+    mkdir -p "$CONFIG_DIR"
+    if [[ ! -f "$BOOKMARKS_FILE" ]]; then
+        printf '# usher bookmarks — one bookmark per line: name=/path/to/folder\n' > "$BOOKMARKS_FILE"
+    fi
+    if grep -q "^${name}=" "$BOOKMARKS_FILE"; then
+        sed -i "s|^${name}=.*|${name}=${dir}|" "$BOOKMARKS_FILE"
+        notify "usher bookmark updated" "${name} → ${dir}"
+    else
+        printf '%s=%s\n' "$name" "$dir" >> "$BOOKMARKS_FILE"
+        notify "usher bookmark added" "${name} → ${dir}"
+    fi
+}
+
+remove_bookmark() {
+    local name="${1:-}"
+    if [[ -z "$name" ]]; then
+        echo "usher: --unbookmark requires a name." >&2
+        exit 1
+    fi
+    if [[ ! -f "$BOOKMARKS_FILE" ]] || ! grep -q "^${name}=" "$BOOKMARKS_FILE"; then
+        echo "usher: no bookmark named '${name}'." >&2
+        exit 1
+    fi
+    sed -i "/^${name}=/d" "$BOOKMARKS_FILE"
+    echo "Bookmark '${name}' removed."
+}
+
+list_bookmarks() {
+    if [[ ! -f "$BOOKMARKS_FILE" ]] || ! grep -q "^[^#]" "$BOOKMARKS_FILE"; then
+        echo "No bookmarks set.  Use: usher --bookmark NAME [DIR]"
+        return
+    fi
+    grep "^[^#]" "$BOOKMARKS_FILE" | while IFS='=' read -r name path; do
+        printf '  %-20s %s\n' "$name" "$path"
+    done
+}
+
 # Graphical directory picker; prints the chosen path or returns non-zero.
 pick_dir() {
-    local title="${1:-caddyup — choose a folder to serve}"
+    local title="${1:-usher — choose a folder to serve}"
     if command -v zenity >/dev/null 2>&1; then
         zenity --file-selection --directory --title="$title" 2>/dev/null
     else
@@ -85,18 +153,18 @@ pick_dir() {
 
 set_default() {
     local dir="${1:-}"
-    [[ -z "$dir" ]] && dir="$(pick_dir 'caddyup — choose default folder to serve')" || true
+    [[ -z "$dir" ]] && dir="$(pick_dir 'usher — choose default folder to serve')" || true
     dir="${dir/#\~/$HOME}"
     if [[ -z "$dir" ]]; then
         echo "No folder given; default unchanged."
         exit 1
     fi
     if [[ ! -d "$dir" ]]; then
-        notify "caddyup" "Not a directory: $dir"
+        notify "usher" "Not a directory: $dir"
         exit 1
     fi
     update_config DEFAULT_ROOT "$dir"
-    notify "caddyup default set" "$dir"
+    notify "usher default set" "$dir"
 }
 
 is_running() {
@@ -106,7 +174,7 @@ is_running() {
 stop_server() {
     if is_running; then
         kill "$(cat "$PID_FILE")" 2>/dev/null || true
-        notify "caddyup stopped"
+        notify "usher stopped"
     else
         echo "No running background server found."
         rm -f "$PID_FILE"
@@ -115,9 +183,9 @@ stop_server() {
 
 status() {
     if is_running; then
-        echo "caddyup is running (PID $(cat "$PID_FILE")) on https://127.0.0.1:${PORT}"
+        echo "usher is running (PID $(cat "$PID_FILE")) on https://127.0.0.1:${PORT}"
     else
-        echo "caddyup is not running."
+        echo "usher is not running."
     fi
 }
 
@@ -134,20 +202,20 @@ serve() {
     local root="${1/#\~/$HOME}"
 
     if [[ ! -d "$root" ]]; then
-        notify "caddyup" "Not a directory: $root"
+        notify "usher" "Not a directory: $root"
         exit 1
     fi
     if is_running; then
-        notify "caddyup already running" "Stop it first: caddyup --stop"
+        notify "usher already running" "Stop it first: usher --stop"
         exit 1
     fi
     if ! command -v caddy >/dev/null 2>&1; then
-        notify "caddyup" "Caddy is not installed."
+        notify "usher" "Caddy is not installed."
         exit 1
     fi
 
     # Private working directory; cleaned up on exit. Nothing lands in $root.
-    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/caddyup.XXXXXX")"
+    WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/usher.XXXXXX")"
     local php_sock="${WORK_DIR}/php-fpm.sock"
     local php_conf="${WORK_DIR}/php-fpm.conf"
     local php_log="${WORK_DIR}/php-fpm.log"
@@ -260,7 +328,7 @@ ${php_block}
 EOF
 
     # ── Launch Caddy in the background so signals reach the trap cleanly ───────
-    notify "caddyup" "Serving ${root} at https://127.0.0.1:${PORT}"
+    notify "usher" "Serving ${root} at https://127.0.0.1:${PORT}"
     if command -v jq >/dev/null 2>&1; then
         caddy run --config "$caddyfile" --adapter caddyfile \
             > >(jq --unbuffered -r '"[\(.ts | todate)] [36m[\(.request.method)][0m \(.request.uri)  [[32m\(.status)[0m]"' 2>/dev/null) &
@@ -283,7 +351,10 @@ main() {
         --status)      status; exit 0 ;;
         --set-default) set_default "${2:-}"; exit 0 ;;
         --pick)        root="$(pick_dir)" || exit 0; [[ -z "$root" ]] && exit 0 ;;
-        -*)            echo "caddyup: unknown option: $1" >&2; usage; exit 1 ;;
+        --bookmark)    set_bookmark "${2:-}" "${3:-}"; exit 0 ;;
+        --unbookmark)  remove_bookmark "${2:-}"; exit 0 ;;
+        --bookmarks)   list_bookmarks; exit 0 ;;
+        -*)            echo "usher: unknown option: $1" >&2; usage; exit 1 ;;
         "")
             if [[ -n "${DEFAULT_ROOT:-}" ]]; then
                 root="$DEFAULT_ROOT"
@@ -295,7 +366,10 @@ main() {
                 [[ -z "$root" ]] && exit 0
             fi
             ;;
-        *)             root="$1" ;;
+        *)
+            local bm_path
+            bm_path="$(lookup_bookmark "$1")" && root="$bm_path" || root="$1"
+            ;;
     esac
     serve "$root"
 }
