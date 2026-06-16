@@ -46,7 +46,7 @@ _usher() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            '--pick --set-default --bookmark --unbookmark --bookmarks --stop --status --help' \
+            '--pick --set-default --bookmark --new-bookmark --unbookmark --bookmarks --stop --status --help' \
             -- "$cur") )
         return
     fi

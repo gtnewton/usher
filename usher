@@ -10,6 +10,7 @@
 #   usher --pick                 Pick a folder graphically, then serve it.
 #   usher --set-default [DIR]    Set the default root (graphical picker if no DIR).
 #   usher --bookmark NAME [DIR]  Save a bookmark (graphical picker if no DIR).
+#   usher --new-bookmark         Create a bookmark via graphical prompts.
 #   usher --unbookmark NAME      Remove a bookmark.
 #   usher --bookmarks            List all bookmarks.
 #   usher --stop                 Stop a server started in the background.
@@ -18,9 +19,9 @@
 #
 # To serve a local subdirectory that shares a name with a bookmark, use ./name.
 #
-# Settings live in ~/.config/usher/config (DEFAULT_ROOT, PORT). Certificates
-# live in ~/.local/share/usher/ (cert.pem, key.pem); without them Caddy
-# falls back to its own internal CA.
+# Settings live in ~/.config/usher/config (DEFAULT_ROOT, PORT, MIME_TYPES,
+# CADDY_EXTRA). Certificates live in ~/.local/share/usher/ (cert.pem, key.pem);
+# without them Caddy falls back to its own internal CA.
 
 set -euo pipefail
 
@@ -50,6 +51,7 @@ KEY_FILE="${DATA_DIR}/key.pem"
 WORK_DIR=""
 CADDY_PID=""
 PHP_PID_FILE=""
+BADGE_PID=""
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -64,6 +66,42 @@ notify() {
         notify-send -a usher "$title" "$body" 2>/dev/null || true
     fi
     echo "${title}${body:+: $body}"
+}
+
+# Show (true) or clear (false) a count badge on the dock icon.
+# Requires Ubuntu Dock / Dash to Dock and python3-gi; silently no-ops otherwise.
+# The dock tracks the badge by the D-Bus connection's lifetime: we keep a
+# background Python process alive to hold that connection open, so the badge
+# persists. Killing the process triggers NameOwnerChanged and auto-clears it.
+launcher_badge() {
+    local visible="${1:-true}"
+    command -v python3 >/dev/null 2>&1 || return 0
+    [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && return 0
+
+    if [[ "$visible" == true ]]; then
+        python3 - <<'PYEOF' 2>/dev/null &
+import gi, signal
+gi.require_version('GLib', '2.0')
+gi.require_version('Gio', '2.0')
+from gi.repository import GLib, Gio
+
+bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+bus.emit_signal(None,
+    '/com/canonical/unity/launcherentry/usher',
+    'com.canonical.Unity.LauncherEntry', 'Update',
+    GLib.Variant('(sa{sv})', ('application://usher.desktop',
+        {'count': GLib.Variant('x', 1), 'count-visible': GLib.Variant('b', True)})))
+
+loop = GLib.MainLoop()
+signal.signal(signal.SIGTERM, lambda *_: loop.quit())
+signal.signal(signal.SIGINT, lambda *_: loop.quit())
+loop.run()
+PYEOF
+        BADGE_PID=$!
+    else
+        [[ -n "${BADGE_PID:-}" ]] && kill "$BADGE_PID" 2>/dev/null || true
+        BADGE_PID=""
+    fi
 }
 
 # Persist a key=value pair to the config file, replacing any existing entry.
@@ -113,6 +151,20 @@ set_bookmark() {
         printf '%s=%s\n' "$name" "$dir" >> "$BOOKMARKS_FILE"
         notify "usher bookmark added" "${name} → ${dir}"
     fi
+}
+
+new_bookmark() {
+    if ! command -v zenity >/dev/null 2>&1; then
+        echo "usher: zenity is required for graphical bookmark creation." >&2
+        exit 1
+    fi
+    local name
+    name="$(zenity --entry \
+        --title="usher — new bookmark" \
+        --text="Bookmark name (letters, digits, hyphens, underscores):" \
+        2>/dev/null)" || exit 0
+    [[ -z "$name" ]] && exit 0
+    set_bookmark "$name"
 }
 
 remove_bookmark() {
@@ -189,11 +241,63 @@ status() {
     fi
 }
 
+gui_panel() {
+    command -v zenity >/dev/null 2>&1 || { notify "usher" "zenity is required for the GUI panel."; exit 1; }
+
+    local status_text items=()
+
+    if is_running; then
+        status_text="Running on https://127.0.0.1:${PORT}"
+        items+=("Stop server")
+    else
+        status_text="Server is not running."
+        [[ -n "${DEFAULT_ROOT:-}" ]] && items+=("Serve: ${DEFAULT_ROOT##*/}")
+        if [[ -f "$BOOKMARKS_FILE" ]] && grep -q "^[^#]" "$BOOKMARKS_FILE"; then
+            while IFS='=' read -r name _; do
+                items+=("$name")
+            done < <(grep "^[^#]" "$BOOKMARKS_FILE")
+        fi
+        items+=("Serve a folder…")
+    fi
+    items+=("Add bookmark…" "Set default folder…")
+
+    local n=${#items[@]} choice
+    choice=$(zenity --list \
+        --title="usher" \
+        --text="$status_text" \
+        --column="Action" \
+        --hide-header \
+        --width=300 \
+        --height=$(( 110 + n * 36 )) \
+        "${items[@]}" 2>/dev/null) || return 0
+    [[ -z "$choice" ]] && return 0
+
+    case "$choice" in
+        "Stop server")
+            stop_server ;;
+        "Serve: "*)
+            serve "$DEFAULT_ROOT" & ;;
+        "Serve a folder…")
+            local dir
+            dir="$(pick_dir)" || return 0
+            [[ -n "$dir" ]] && serve "$dir" & ;;
+        "Add bookmark…")
+            new_bookmark ;;
+        "Set default folder…")
+            set_default ;;
+        *)
+            local bm_path
+            bm_path="$(lookup_bookmark "$choice")" || { notify "usher" "Unknown bookmark: $choice"; return 1; }
+            serve "$bm_path" & ;;
+    esac
+}
+
 cleanup() {
     [[ -n "$CADDY_PID" ]] && kill "$CADDY_PID" 2>/dev/null || true
     [[ -n "$PHP_PID_FILE" && -f "$PHP_PID_FILE" ]] && kill "$(cat "$PHP_PID_FILE")" 2>/dev/null || true
     [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
     rm -f "$PID_FILE"
+    launcher_badge false
 }
 
 # ── Core: serve a directory ──────────────────────────────────────────────────
@@ -298,6 +402,17 @@ EOF
 "
     fi
 
+    # ── Custom MIME types from config (MIME_TYPES array: "ext:content/type") ──
+    local mime_block=""
+    if [[ -v MIME_TYPES && ${#MIME_TYPES[@]} -gt 0 ]]; then
+        for _entry in "${MIME_TYPES[@]}"; do
+            mime_block+="    mime ${_entry%%:*} ${_entry#*:}"$'\n'
+        done
+    fi
+
+    # ── Extra site-block directives from config (CADDY_EXTRA string) ──────────
+    local extra_block="${CADDY_EXTRA:-}"
+
     # ── Caddyfile ─────────────────────────────────────────────────────────────
     cat > "$caddyfile" <<EOF
 {
@@ -313,7 +428,7 @@ https://127.0.0.1:${PORT} {
         output stdout
         format ${log_format}
     }
-${php_block}
+${php_block}${mime_block}
     file_server
 
     header {
@@ -324,11 +439,13 @@ ${php_block}
 
     @options method OPTIONS
     respond @options 204
+${extra_block}
 }
 EOF
 
     # ── Launch Caddy in the background so signals reach the trap cleanly ───────
     notify "usher" "Serving ${root} at https://127.0.0.1:${PORT}"
+    launcher_badge true
     if command -v jq >/dev/null 2>&1; then
         caddy run --config "$caddyfile" --adapter caddyfile \
             > >(jq --unbuffered -r '"[\(.ts | todate)] [36m[\(.request.method)][0m \(.request.uri)  [[32m\(.status)[0m]"' 2>/dev/null) &
@@ -351,19 +468,19 @@ main() {
         --status)      status; exit 0 ;;
         --set-default) set_default "${2:-}"; exit 0 ;;
         --pick)        root="$(pick_dir)" || exit 0; [[ -z "$root" ]] && exit 0 ;;
+        --new-bookmark) new_bookmark; exit 0 ;;
         --bookmark)    set_bookmark "${2:-}" "${3:-}"; exit 0 ;;
         --unbookmark)  remove_bookmark "${2:-}"; exit 0 ;;
         --bookmarks)   list_bookmarks; exit 0 ;;
         -*)            echo "usher: unknown option: $1" >&2; usage; exit 1 ;;
         "")
-            if [[ -n "${DEFAULT_ROOT:-}" ]]; then
-                root="$DEFAULT_ROOT"
-            elif [[ -t 1 ]]; then
-                root="$PWD"
+            if [[ -t 1 ]]; then
+                # Terminal: serve default or CWD directly.
+                root="${DEFAULT_ROOT:-$PWD}"
             else
-                # GUI launch with no default configured: ask for a folder.
-                root="$(pick_dir)" || exit 0
-                [[ -z "$root" ]] && exit 0
+                # GUI (launcher click): show the control panel.
+                gui_panel
+                exit 0
             fi
             ;;
         *)

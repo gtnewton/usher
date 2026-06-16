@@ -9,7 +9,7 @@ Type=Application
 Categories=Development;WebDevelopment;
 Icon=usher
 StartupNotify=false
-Actions=serve-folder;set-default;stop;
+Actions=serve-folder;set-default;add-bookmark;stop;
 
 [Desktop Action serve-folder]
 Name=Serve a folder…
@@ -18,6 +18,10 @@ Exec=usher --pick
 [Desktop Action set-default]
 Name=Set default folder…
 Exec=usher --set-default
+
+[Desktop Action add-bookmark]
+Name=Add bookmark…
+Exec=usher --new-bookmark
 
 [Desktop Action stop]
 Name=Stop server
