@@ -331,15 +331,20 @@ serve() {
     trap 'exit 143' TERM
 
     # ── Optional PHP-FPM ──────────────────────────────────────────────────────
+    # Resolve a php-fpm binary. /usr/sbin holds the FPM binaries on Debian/Ubuntu
+    # but is often absent from the PATH of a GUI-launched process, so fall back to
+    # probing it directly (matching install.sh) before giving up.
     local php_enabled=false php_fpm_bin=""
     if command -v php >/dev/null 2>&1; then
-        local php_ver
+        local php_ver cand
         php_ver="$(php -r 'echo PHP_MAJOR_VERSION.".".PHP_MINOR_VERSION;')"
-        if command -v "php-fpm${php_ver}" >/dev/null 2>&1; then
-            php_fpm_bin="php-fpm${php_ver}"
-        elif command -v php-fpm >/dev/null 2>&1; then
-            php_fpm_bin="php-fpm"
-        fi
+        for cand in "php-fpm${php_ver}" php-fpm \
+                    "/usr/sbin/php-fpm${php_ver}" /usr/sbin/php-fpm; do
+            if command -v "$cand" >/dev/null 2>&1; then
+                php_fpm_bin="$cand"
+                break
+            fi
+        done
     fi
 
     if [[ -n "$php_fpm_bin" ]]; then
@@ -454,7 +459,10 @@ EOF
     fi
     CADDY_PID=$!
     mkdir -p "$RUN_DIR"
-    echo "$$" > "$PID_FILE"
+    # $BASHPID, not $$: when serve runs backgrounded (the GUI path) $$ is the
+    # parent shell that is about to exit, so the PID file would point at a dead
+    # process and --stop/--status would lose track of the server.
+    echo "$BASHPID" > "$PID_FILE"
     wait "$CADDY_PID"
 }
 
