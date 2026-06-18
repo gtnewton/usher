@@ -1,0 +1,8 @@
+{
+  "name": "Usher",
+  "description": "Top-bar indicator for the usher local HTTPS dev server",
+  "uuid": "usher@gtnewton.github.com",
+  "shell-version": ["45", "46", "47", "48"],
+  "version": 1,
+  "url": "https://github.com/gtnewton/usher"
+}

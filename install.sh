@@ -100,6 +100,22 @@ mkdir -p "$COMPLETION_DIR"
 install -m 0644 "${BUNDLE_DIR}/usher-completion.bash" "${COMPLETION_DIR}/usher"
 echo "Installed bash completion"
 
+# ── GNOME Shell extension ─────────────────────────────────────────────────────
+
+if [[ -d "${BUNDLE_DIR}/extension" ]]; then
+    mkdir -p "${DATA_DIR}/extension"
+    cp -r "${BUNDLE_DIR}/extension/." "${DATA_DIR}/extension/"
+    echo "Installed extension source to ${DATA_DIR}/extension"
+
+    if [[ "${XDG_CURRENT_DESKTOP:-}" == *GNOME* ]] && \
+       command -v gnome-extensions >/dev/null 2>&1; then
+        read -rp "Install the GNOME Shell top-bar extension? [y/N] " _yn
+        if [[ "$_yn" =~ ^[Yy] ]]; then
+            "${BIN_DIR}/usher" install-extension
+        fi
+    fi
+fi
+
 # ── Default root ──────────────────────────────────────────────────────────────
 
 echo
@@ -124,3 +140,4 @@ echo "  usher --port PORT [DIR]  serve on a specific port"
 echo "  usher --status           list all running servers"
 echo "  usher --stop [PORT]      stop one or all servers"
 echo "  usher --set-default [DIR] / --pick / --bookmarks"
+echo "  usher install-extension    install the GNOME Shell top-bar extension"

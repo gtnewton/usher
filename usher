@@ -15,6 +15,8 @@
 #   usher --bookmarks                List all bookmarks.
 #   usher --stop [PORT]              Stop a background server (all if no PORT given).
 #   usher --status                   Report all running background servers.
+#   usher install-extension          Install the GNOME Shell top-bar extension.
+#   usher uninstall-extension        Remove the GNOME Shell top-bar extension.
 #   usher -h | --help                Show this help.
 #
 # To serve a local subdirectory that shares a name with a bookmark, use ./name.
@@ -57,7 +59,7 @@ PHP_PID_FILE=""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 usage() {
-    sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 notify() {
@@ -372,6 +374,35 @@ gui_panel() {
     esac
 }
 
+install_extension() {
+    local src="${DATA_DIR}/extension"
+    local dest="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/usher@gtnewton.github.com"
+    if [[ ! -d "$src" ]]; then
+        echo "usher: extension source not found at ${src}." >&2
+        echo "       Re-run install.sh from the usher repository to install it." >&2
+        exit 1
+    fi
+    mkdir -p "$dest"
+    cp -r "${src}/." "$dest/"
+    echo "Extension installed to ${dest}"
+    if command -v gnome-extensions >/dev/null 2>&1; then
+        gnome-extensions enable "usher@gtnewton.github.com" 2>/dev/null \
+            && echo "Extension enabled — it will appear in the top bar shortly." \
+            || echo "Enable manually: gnome-extensions enable usher@gtnewton.github.com"
+    else
+        echo "Enable with: gnome-extensions enable usher@gtnewton.github.com"
+    fi
+}
+
+uninstall_extension() {
+    local dest="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/usher@gtnewton.github.com"
+    if command -v gnome-extensions >/dev/null 2>&1; then
+        gnome-extensions disable "usher@gtnewton.github.com" 2>/dev/null || true
+    fi
+    rm -rf "$dest"
+    echo "Extension removed."
+}
+
 cleanup() {
     [[ -n "$CADDY_PID" ]] && kill "$CADDY_PID" 2>/dev/null || true
     [[ -n "$PHP_PID_FILE" && -f "$PHP_PID_FILE" ]] && kill "$(cat "$PHP_PID_FILE")" 2>/dev/null || true
@@ -594,7 +625,9 @@ main() {
         --new-bookmark) new_bookmark; exit 0 ;;
         --bookmark)     set_bookmark "${2:-}" "${3:-}"; exit 0 ;;
         --unbookmark)   remove_bookmark "${2:-}"; exit 0 ;;
-        --bookmarks)    list_bookmarks; exit 0 ;;
+        --bookmarks)           list_bookmarks; exit 0 ;;
+        install-extension)   install_extension; exit 0 ;;
+        uninstall-extension) uninstall_extension; exit 0 ;;
         -*)             echo "usher: unknown option: $1" >&2; usage; exit 1 ;;
         "")
             if [[ -t 1 ]]; then

@@ -30,7 +30,7 @@ _usher() {
         --unbookmark)
             COMPREPLY=( $(compgen -W "$(_usher_bookmarks)" -- "$cur") )
             return ;;
-        --set-default)
+        --set-default|--port)
             _usher_filedir
             return ;;
         --bookmark)
@@ -46,9 +46,15 @@ _usher() {
 
     if [[ "$cur" == -* ]]; then
         COMPREPLY=( $(compgen -W \
-            '--pick --set-default --bookmark --new-bookmark --unbookmark --bookmarks --stop --status --help' \
+            '--port --pick --set-default --bookmark --new-bookmark --unbookmark --bookmarks --stop --status --help' \
             -- "$cur") )
         return
+    fi
+
+    # Positional subcommands
+    if [[ $cword -eq 1 ]]; then
+        local subcommands='install-extension uninstall-extension'
+        COMPREPLY+=( $(compgen -W "$subcommands" -- "$cur") )
     fi
 
     # First positional arg: bookmark names + directories

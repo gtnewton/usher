@@ -1,0 +1,8 @@
+.usher-inactive {
+    opacity: 0.4;
+}
+
+.usher-count-label {
+    padding: 0 2px;
+    font-weight: bold;
+}
