@@ -24,6 +24,14 @@ echo "Removing usher..."
 update-desktop-database "${XDG_DATA_HOME:-$HOME/.local/share}/applications" 2>/dev/null || true
 gtk-update-icon-cache -f -t "${XDG_DATA_HOME:-$HOME/.local/share}/icons/hicolor" 2>/dev/null || true
 
+EXTENSION_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/usher@gtnewton.github.com"
+if [[ -d "$EXTENSION_DIR" ]]; then
+    command -v gnome-extensions >/dev/null 2>&1 && \
+        gnome-extensions disable "usher@gtnewton.github.com" 2>/dev/null || true
+    rm -rf "$EXTENSION_DIR"
+    echo "Removed $EXTENSION_DIR"
+fi
+
 if [[ -d "$DATA_DIR" || -d "$CONFIG_DIR" ]]; then
     echo
     read -rp "Also remove the certificate and config (${DATA_DIR}, ${CONFIG_DIR})? [y/N] " choice
