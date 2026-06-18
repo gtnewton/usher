@@ -39,7 +39,11 @@ if ! command -v php >/dev/null 2>&1 || [[ "$have_fpm" == false ]]; then
     echo "      For PHP support: sudo apt install php-fpm"
 fi
 
-command -v jq    >/dev/null 2>&1 || echo "NOTE: 'jq' not found — access logs will be less tidy (sudo apt install jq)."
+if ! command -v jq >/dev/null 2>&1; then
+    echo "ERROR: jq is required but not found."
+    echo "  Install: sudo apt install jq"
+    exit 1
+fi
 command -v zenity >/dev/null 2>&1 || echo "NOTE: 'zenity' not found — the launcher's folder pickers need it (sudo apt install zenity)."
 
 # ── Script ────────────────────────────────────────────────────────────────────
@@ -115,5 +119,8 @@ fi
 
 echo
 echo "Done. Usage:"
-echo "  usher [DIR]        serve a folder over https://127.0.0.1:8443"
-echo "  usher --set-default [DIR] / --pick / --stop / --status"
+echo "  usher [DIR]              serve a folder (auto-picks a free port from ${PORT:-8443})"
+echo "  usher --port PORT [DIR]  serve on a specific port"
+echo "  usher --status           list all running servers"
+echo "  usher --stop [PORT]      stop one or all servers"
+echo "  usher --set-default [DIR] / --pick / --bookmarks"

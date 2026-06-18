@@ -5,23 +5,24 @@
 #             directory; nothing is ever written into the folder being served.
 #
 # Usage:
-#   usher [DIR]                  Serve DIR (defaults to the configured root).
-#   usher NAME                   Serve the directory saved under bookmark NAME.
-#   usher --pick                 Pick a folder graphically, then serve it.
-#   usher --set-default [DIR]    Set the default root (graphical picker if no DIR).
-#   usher --bookmark NAME [DIR]  Save a bookmark (graphical picker if no DIR).
-#   usher --new-bookmark         Create a bookmark via graphical prompts.
-#   usher --unbookmark NAME      Remove a bookmark.
-#   usher --bookmarks            List all bookmarks.
-#   usher --stop                 Stop a server started in the background.
-#   usher --status               Report whether a background server is running.
-#   usher -h | --help            Show this help.
+#   usher [--port PORT] [DIR]        Serve DIR (defaults to configured root).
+#   usher [--port PORT] NAME         Serve the directory saved under bookmark NAME.
+#   usher [--port PORT] --pick        Pick a folder graphically, then serve it.
+#   usher --set-default [DIR]        Set the default root (graphical picker if no DIR).
+#   usher --bookmark NAME [DIR]      Save a bookmark (graphical picker if no DIR).
+#   usher --new-bookmark             Create a bookmark via graphical prompts.
+#   usher --unbookmark NAME          Remove a bookmark.
+#   usher --bookmarks                List all bookmarks.
+#   usher --stop [PORT]              Stop a background server (all if no PORT given).
+#   usher --status                   Report all running background servers.
+#   usher -h | --help                Show this help.
 #
 # To serve a local subdirectory that shares a name with a bookmark, use ./name.
 #
 # Settings live in ~/.config/usher/config (DEFAULT_ROOT, PORT, MIME_TYPES,
-# CADDY_EXTRA). Certificates live in ~/.local/share/usher/ (cert.pem, key.pem);
-# without them Caddy falls back to its own internal CA.
+# CADDY_EXTRA). PORT sets the base port; usher auto-picks the next free port
+# above it when starting. Certificates live in ~/.local/share/usher/ (cert.pem,
+# key.pem); without them Caddy falls back to its own internal CA.
 
 set -euo pipefail
 
@@ -31,6 +32,8 @@ set -euo pipefail
 # persist this to the config file below, which overrides this line.
 DEFAULT_ROOT=""
 
+# Base port. usher auto-picks the first free port at or above this value
+# unless --port is given explicitly. Persisted overrides come from the config.
 PORT="${PORT:-8443}"
 
 DATA_DIR="${XDG_DATA_HOME:-$HOME/.local/share}/usher"
@@ -38,7 +41,6 @@ CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/usher"
 CONFIG_FILE="${CONFIG_DIR}/config"
 BOOKMARKS_FILE="${CONFIG_DIR}/bookmarks"
 RUN_DIR="${XDG_RUNTIME_DIR:-/tmp}/usher"
-PID_FILE="${RUN_DIR}/usher.pid"
 
 CERT_FILE="${DATA_DIR}/cert.pem"
 KEY_FILE="${DATA_DIR}/key.pem"
@@ -51,12 +53,11 @@ KEY_FILE="${DATA_DIR}/key.pem"
 WORK_DIR=""
 CADDY_PID=""
 PHP_PID_FILE=""
-BADGE_PID=""
 
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 usage() {
-    sed -n '3,20p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,25p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 notify() {
@@ -68,39 +69,64 @@ notify() {
     echo "${title}${body:+: $body}"
 }
 
-# Show (true) or clear (false) a count badge on the dock icon.
-# Requires Ubuntu Dock / Dash to Dock and python3-gi; silently no-ops otherwise.
-# The dock tracks the badge by the D-Bus connection's lifetime: we keep a
-# background Python process alive to hold that connection open, so the badge
-# persists. Killing the process triggers NameOwnerChanged and auto-clears it.
+# Find the lowest free TCP port at or above $base (probes up to 20 candidates).
+pick_free_port() {
+    local base="${1:-8443}" port
+    for port in $(seq "$base" $((base + 19))); do
+        ss -tlnH 2>/dev/null | grep -qF ":${port}" || { echo "$port"; return 0; }
+    done
+    echo "usher: no free port found in range ${base}–$((base + 19))" >&2
+    return 1
+}
+
+# Emit machine-readable state for a port to ${RUN_DIR}/state-PORT.json.
+# This is the contract the future GNOME extension will watch via Gio.FileMonitor.
+write_state() {
+    local status="$1" root="${2:-}" port="${3:-$PORT}"
+    mkdir -p "$RUN_DIR"
+    jq -n \
+        --arg   status "$status" \
+        --arg   root   "$root" \
+        --argjson port  "$port" \
+        --arg   ts     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{status:$status, root:$root, port:$port, updated_at:$ts}' \
+        > "${RUN_DIR}/state-${port}.json"
+}
+
+# Set (count>0) or clear (count=0) the dock badge.
+# All instances share one badge-keeper process tracked in ${RUN_DIR}/badge.pid;
+# each start/stop kills the old keeper and restarts it with the current count.
 launcher_badge() {
-    local visible="${1:-true}"
+    local count="${1:-0}"
     command -v python3 >/dev/null 2>&1 || return 0
     [[ -z "${DBUS_SESSION_BUS_ADDRESS:-}" ]] && return 0
 
-    if [[ "$visible" == true ]]; then
-        python3 - <<'PYEOF' 2>/dev/null &
-import gi, signal
+    local badge_pid_file="${RUN_DIR}/badge.pid"
+    if [[ -f "$badge_pid_file" ]]; then
+        kill "$(< "$badge_pid_file")" 2>/dev/null || true
+        rm -f "$badge_pid_file"
+    fi
+
+    if [[ "$count" -gt 0 ]]; then
+        python3 - "$count" <<'PYEOF' 2>/dev/null &
+import gi, signal, sys
 gi.require_version('GLib', '2.0')
 gi.require_version('Gio', '2.0')
 from gi.repository import GLib, Gio
-
+count = int(sys.argv[1])
 bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
 bus.emit_signal(None,
     '/com/canonical/unity/launcherentry/usher',
     'com.canonical.Unity.LauncherEntry', 'Update',
     GLib.Variant('(sa{sv})', ('application://usher.desktop',
-        {'count': GLib.Variant('x', 1), 'count-visible': GLib.Variant('b', True)})))
-
+        {'count': GLib.Variant('x', count), 'count-visible': GLib.Variant('b', True)})))
 loop = GLib.MainLoop()
 signal.signal(signal.SIGTERM, lambda *_: loop.quit())
 signal.signal(signal.SIGINT, lambda *_: loop.quit())
 loop.run()
 PYEOF
-        BADGE_PID=$!
-    else
-        [[ -n "${BADGE_PID:-}" ]] && kill "$BADGE_PID" 2>/dev/null || true
-        BADGE_PID=""
+        mkdir -p "$RUN_DIR"
+        echo $! > "$badge_pid_file"
     fi
 }
 
@@ -219,36 +245,90 @@ set_default() {
     notify "usher default set" "$dir"
 }
 
-is_running() {
-    [[ -f "$PID_FILE" ]] && kill -0 "$(cat "$PID_FILE" 2>/dev/null)" 2>/dev/null
+# Returns 0 if a usher server is running on the given port.
+is_running_on() {
+    local port="$1" pid_file
+    pid_file="${RUN_DIR}/usher-${port}.pid"
+    [[ -f "$pid_file" ]] && kill -0 "$(< "$pid_file")" 2>/dev/null
+}
+
+# Prints each live port on its own line; returns 1 if none are running.
+list_running() {
+    [[ -d "$RUN_DIR" ]] || return 1
+    local pid_file port any=false
+    for pid_file in "${RUN_DIR}"/usher-*.pid; do
+        [[ -f "$pid_file" ]] || continue   # handles no-match glob expansion
+        port="${pid_file##*-}"; port="${port%.pid}"
+        is_running_on "$port" && { echo "$port"; any=true; } || true
+    done
+    [[ "$any" == true ]]
 }
 
 stop_server() {
-    if is_running; then
-        kill "$(cat "$PID_FILE")" 2>/dev/null || true
-        notify "usher stopped"
-    else
-        echo "No running background server found."
-        rm -f "$PID_FILE"
+    local target_port="${1:-}"
+
+    if [[ -n "$target_port" ]]; then
+        local pid_file="${RUN_DIR}/usher-${target_port}.pid"
+        if is_running_on "$target_port"; then
+            kill "$(< "$pid_file")" 2>/dev/null || true
+            notify "usher stopped" "port ${target_port}"
+        else
+            echo "No running server on port ${target_port}."
+            rm -f "$pid_file"
+        fi
+        return
     fi
+
+    local -a ports
+    mapfile -t ports < <(list_running 2>/dev/null || true)
+    if [[ ${#ports[@]} -eq 0 ]]; then
+        echo "No running background servers found."
+        return
+    fi
+    for port in "${ports[@]}"; do
+        kill "$(< "${RUN_DIR}/usher-${port}.pid")" 2>/dev/null || true
+        notify "usher stopped" "port ${port}"
+    done
 }
 
 status() {
-    if is_running; then
-        echo "usher is running (PID $(cat "$PID_FILE")) on https://127.0.0.1:${PORT}"
-    else
+    local -a ports
+    mapfile -t ports < <(list_running 2>/dev/null || true)
+    if [[ ${#ports[@]} -eq 0 ]]; then
         echo "usher is not running."
+        return
     fi
+    local port state_file root pid
+    for port in "${ports[@]}"; do
+        pid="$(< "${RUN_DIR}/usher-${port}.pid")"
+        state_file="${RUN_DIR}/state-${port}.json"
+        root=""
+        [[ -f "$state_file" ]] && root="$(jq -r '.root' "$state_file")"
+        printf 'usher running  https://127.0.0.1:%s  %s  (PID %s)\n' \
+            "$port" "${root:-?}" "$pid"
+    done
 }
 
 gui_panel() {
     command -v zenity >/dev/null 2>&1 || { notify "usher" "zenity is required for the GUI panel."; exit 1; }
 
+    local -a running_ports
+    mapfile -t running_ports < <(list_running 2>/dev/null || true)
+
     local status_text items=()
 
-    if is_running; then
-        status_text="Running on https://127.0.0.1:${PORT}"
-        items+=("Stop server")
+    if [[ ${#running_ports[@]} -gt 0 ]]; then
+        if [[ ${#running_ports[@]} -eq 1 ]]; then
+            local port="${running_ports[0]}"
+            local state_file="${RUN_DIR}/state-${port}.json"
+            local rdir; rdir="$(jq -r '.root' "$state_file" 2>/dev/null || echo '?')"
+            status_text="Running: https://127.0.0.1:${port}\n${rdir}"
+        else
+            status_text="${#running_ports[@]} servers running"
+        fi
+        for port in "${running_ports[@]}"; do
+            items+=("Stop :${port}")
+        done
     else
         status_text="Server is not running."
         [[ -n "${DEFAULT_ROOT:-}" ]] && items+=("Serve: ${DEFAULT_ROOT##*/}")
@@ -273,8 +353,8 @@ gui_panel() {
     [[ -z "$choice" ]] && return 0
 
     case "$choice" in
-        "Stop server")
-            stop_server ;;
+        "Stop :"*)
+            stop_server "${choice#Stop :}" ;;
         "Serve: "*)
             serve "$DEFAULT_ROOT" & ;;
         "Serve a folder…")
@@ -296,8 +376,10 @@ cleanup() {
     [[ -n "$CADDY_PID" ]] && kill "$CADDY_PID" 2>/dev/null || true
     [[ -n "$PHP_PID_FILE" && -f "$PHP_PID_FILE" ]] && kill "$(cat "$PHP_PID_FILE")" 2>/dev/null || true
     [[ -n "$WORK_DIR" && -d "$WORK_DIR" ]] && rm -rf "$WORK_DIR"
-    rm -f "$PID_FILE"
-    launcher_badge false
+    rm -f "${RUN_DIR}/usher-${PORT}.pid"
+    write_state stopped "" "$PORT"
+    local count; count=$(list_running 2>/dev/null | wc -l) || count=0
+    launcher_badge "$count"
 }
 
 # ── Core: serve a directory ──────────────────────────────────────────────────
@@ -305,12 +387,17 @@ cleanup() {
 serve() {
     local root="${1/#\~/$HOME}"
 
+    # Auto-pick the first free port at or above the base unless pinned by --port.
+    if [[ "${PORT_EXPLICIT:-false}" != true ]]; then
+        PORT="$(pick_free_port "${PORT:-8443}")" || exit 1
+    fi
+
     if [[ ! -d "$root" ]]; then
         notify "usher" "Not a directory: $root"
         exit 1
     fi
-    if is_running; then
-        notify "usher already running" "Stop it first: usher --stop"
+    if is_running_on "$PORT"; then
+        notify "usher" "Port ${PORT} already in use.  Stop it first: usher --stop ${PORT}"
         exit 1
     fi
     if ! command -v caddy >/dev/null 2>&1; then
@@ -378,22 +465,6 @@ EOF
         echo "Note: no certificate at ${CERT_FILE}; using Caddy's internal CA."
     fi
 
-    # ── Log format (pretty via jq when available) ─────────────────────────────
-    local log_format
-    if command -v jq >/dev/null 2>&1; then
-        log_format="json"
-    else
-        log_format="filter {
-            wrap console
-            fields {
-                request>headers delete
-                request>tls delete
-                resp_headers delete
-            }
-        }"
-        echo "Note: install 'jq' for cleaner access logs (sudo apt install jq)."
-    fi
-
     # ── PHP route block (only when PHP-FPM is up) ─────────────────────────────
     local php_block=""
     if [[ "$php_enabled" == true ]]; then
@@ -431,7 +502,7 @@ https://127.0.0.1:${PORT} {
 
     log {
         output stdout
-        format ${log_format}
+        format json
     }
 ${php_block}${mime_block}
     file_server
@@ -450,37 +521,47 @@ EOF
 
     # ── Launch Caddy in the background so signals reach the trap cleanly ───────
     notify "usher" "Serving ${root} at https://127.0.0.1:${PORT}"
-    launcher_badge true
-    if command -v jq >/dev/null 2>&1; then
-        caddy run --config "$caddyfile" --adapter caddyfile \
-            > >(jq --unbuffered -r '"[\(.ts | todate)] [36m[\(.request.method)][0m \(.request.uri)  [[32m\(.status)[0m]"' 2>/dev/null) &
-    else
-        caddy run --config "$caddyfile" --adapter caddyfile &
-    fi
+    caddy run --config "$caddyfile" --adapter caddyfile \
+        > >(jq --unbuffered -r \
+            '"[\(.ts | todate)] [36m[\(.request.method)][0m \(.request.uri)  [[32m\(.status)[0m]"' \
+            2>/dev/null) &
     CADDY_PID=$!
+
     mkdir -p "$RUN_DIR"
     # $BASHPID, not $$: when serve runs backgrounded (the GUI path) $$ is the
     # parent shell that is about to exit, so the PID file would point at a dead
     # process and --stop/--status would lose track of the server.
-    echo "$BASHPID" > "$PID_FILE"
+    echo "$BASHPID" > "${RUN_DIR}/usher-${PORT}.pid"
+    write_state running "$root" "$PORT"
+    local count; count=$(list_running 2>/dev/null | wc -l) || count=0
+    launcher_badge "$count"
     wait "$CADDY_PID"
 }
 
 # ── Entry point ──────────────────────────────────────────────────────────────
 
 main() {
-    local root
+    local root PORT_EXPLICIT=false
+
+    # --port must come before any other flag or path argument.
+    if [[ "${1:-}" == "--port" ]]; then
+        [[ -z "${2:-}" ]] && { echo "usher: --port requires a port number" >&2; exit 1; }
+        PORT="$2"
+        PORT_EXPLICIT=true
+        shift 2
+    fi
+
     case "${1:-}" in
-        -h|--help)     usage; exit 0 ;;
-        --stop)        stop_server; exit 0 ;;
-        --status)      status; exit 0 ;;
-        --set-default) set_default "${2:-}"; exit 0 ;;
-        --pick)        root="$(pick_dir)" || exit 0; [[ -z "$root" ]] && exit 0 ;;
+        -h|--help)      usage; exit 0 ;;
+        --stop)         stop_server "${2:-}"; exit 0 ;;
+        --status)       status; exit 0 ;;
+        --set-default)  set_default "${2:-}"; exit 0 ;;
+        --pick)         root="$(pick_dir)" || exit 0; [[ -z "$root" ]] && exit 0 ;;
         --new-bookmark) new_bookmark; exit 0 ;;
-        --bookmark)    set_bookmark "${2:-}" "${3:-}"; exit 0 ;;
-        --unbookmark)  remove_bookmark "${2:-}"; exit 0 ;;
-        --bookmarks)   list_bookmarks; exit 0 ;;
-        -*)            echo "usher: unknown option: $1" >&2; usage; exit 1 ;;
+        --bookmark)     set_bookmark "${2:-}" "${3:-}"; exit 0 ;;
+        --unbookmark)   remove_bookmark "${2:-}"; exit 0 ;;
+        --bookmarks)    list_bookmarks; exit 0 ;;
+        -*)             echo "usher: unknown option: $1" >&2; usage; exit 1 ;;
         "")
             if [[ -t 1 ]]; then
                 # Terminal: serve default or CWD directly.
