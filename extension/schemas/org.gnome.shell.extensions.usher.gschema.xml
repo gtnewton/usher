@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<schemalist>
+  <schema id="org.gnome.shell.extensions.usher"
+          path="/org/gnome/shell/extensions/usher/">
+    <key name="browser-command" type="s">
+      <default>''</default>
+      <summary>Browser command</summary>
+      <description>
+        Command used to open served URLs. Leave empty to use the system default
+        browser. The URL is appended as the final argument.
+        Example: firefox -P myprofile
+      </description>
+    </key>
+  </schema>
+</schemalist>

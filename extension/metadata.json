@@ -4,5 +4,6 @@
   "uuid": "usher@gtnewton.github.com",
   "shell-version": ["45", "46", "47", "48"],
   "version": 1,
-  "url": "https://github.com/gtnewton/usher"
+  "url": "https://github.com/gtnewton/usher",
+  "settings-schema": "org.gnome.shell.extensions.usher"
 }

@@ -84,14 +84,15 @@ pick_free_port() {
 # Emit machine-readable state for a port to ${RUN_DIR}/state-PORT.json.
 # This is the contract the future GNOME extension will watch via Gio.FileMonitor.
 write_state() {
-    local status="$1" root="${2:-}" port="${3:-$PORT}"
+    local status="$1" root="${2:-}" port="${3:-$PORT}" caddy_pid="${4:-0}"
     mkdir -p "$RUN_DIR"
     jq -n \
-        --arg   status "$status" \
-        --arg   root   "$root" \
-        --argjson port  "$port" \
-        --arg   ts     "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
-        '{status:$status, root:$root, port:$port, updated_at:$ts}' \
+        --arg    status    "$status" \
+        --arg    root      "$root" \
+        --argjson port     "$port" \
+        --argjson caddy_pid "${caddy_pid:-0}" \
+        --arg    ts        "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+        '{status:$status, root:$root, port:$port, caddy_pid:$caddy_pid, updated_at:$ts}' \
         > "${RUN_DIR}/state-${port}.json"
 }
 
@@ -195,6 +196,24 @@ new_bookmark() {
     set_bookmark "$name"
 }
 
+remove_bookmark_gui() {
+    [[ ! -f "$BOOKMARKS_FILE" ]] && { notify "usher" "No bookmarks to remove."; return; }
+    local -a names=()
+    while IFS='=' read -r name _; do
+        [[ -n "$name" ]] && names+=("$name")
+    done < <(grep "^[^#=]" "$BOOKMARKS_FILE" 2>/dev/null)
+    [[ ${#names[@]} -eq 0 ]] && { notify "usher" "No bookmarks to remove."; return; }
+    local chosen
+    chosen="$(zenity --list \
+        --title="usher — remove bookmark" \
+        --text="Select a bookmark to remove:" \
+        --column="Bookmark" \
+        --width=300 \
+        --height=$(( 150 + ${#names[@]} * 50 )) \
+        "${names[@]}" 2>/dev/null)" || return 0
+    [[ -n "$chosen" ]] && remove_bookmark "$chosen" && notify "usher" "Bookmark '${chosen}' removed."
+}
+
 remove_bookmark() {
     local name="${1:-}"
     if [[ -z "$name" ]]; then
@@ -257,11 +276,16 @@ is_running_on() {
 # Prints each live port on its own line; returns 1 if none are running.
 list_running() {
     [[ -d "$RUN_DIR" ]] || return 1
-    local pid_file port any=false
-    for pid_file in "${RUN_DIR}"/usher-*.pid; do
-        [[ -f "$pid_file" ]] || continue   # handles no-match glob expansion
-        port="${pid_file##*-}"; port="${port%.pid}"
-        is_running_on "$port" && { echo "$port"; any=true; } || true
+    local f caddy_pid port status any=false
+    for f in "${RUN_DIR}"/state-*.json; do
+        [[ -f "$f" ]] || continue
+        status="$(jq -r '.status' "$f" 2>/dev/null)" || continue
+        [[ "$status" == "running" ]] || continue
+        port="$(jq -r '.port' "$f" 2>/dev/null)" || continue
+        caddy_pid="$(jq -r '.caddy_pid // 0' "$f" 2>/dev/null)" || continue
+        [[ "$caddy_pid" -gt 0 ]] && kill -0 "$caddy_pid" 2>/dev/null || continue
+        echo "$port"
+        any=true
     done
     [[ "$any" == true ]]
 }
@@ -270,26 +294,35 @@ stop_server() {
     local target_port="${1:-}"
 
     if [[ -n "$target_port" ]]; then
+        local state_file="${RUN_DIR}/state-${target_port}.json"
         local pid_file="${RUN_DIR}/usher-${target_port}.pid"
-        if is_running_on "$target_port"; then
-            kill "$(< "$pid_file")" 2>/dev/null || true
-            notify "usher stopped" "port ${target_port}"
-        else
-            echo "No running server on port ${target_port}."
-            rm -f "$pid_file"
-        fi
+        local caddy_pid
+        caddy_pid="$(jq -r '.caddy_pid // 0' "$state_file" 2>/dev/null || echo 0)"
+        [[ "$caddy_pid" -gt 0 ]] && kill "$caddy_pid" 2>/dev/null || true
+        [[ -f "$pid_file" ]] && kill "$(< "$pid_file")" 2>/dev/null || true
+        write_state stopped "" "$target_port"
+        rm -f "$pid_file"
+        local count; count=$(list_running 2>/dev/null | wc -l) || count=0
+        launcher_badge "$count"
+        notify "usher stopped" "port ${target_port}"
         return
     fi
 
-    local -a ports
-    mapfile -t ports < <(list_running 2>/dev/null || true)
+    local -a ports=()
+    local f port status
+    for f in "${RUN_DIR}"/state-*.json; do
+        [[ -f "$f" ]] || continue
+        status="$(jq -r '.status' "$f" 2>/dev/null)" || continue
+        [[ "$status" == "running" ]] || continue
+        port="$(jq -r '.port' "$f" 2>/dev/null)" || continue
+        ports+=("$port")
+    done
     if [[ ${#ports[@]} -eq 0 ]]; then
         echo "No running background servers found."
         return
     fi
     for port in "${ports[@]}"; do
-        kill "$(< "${RUN_DIR}/usher-${port}.pid")" 2>/dev/null || true
-        notify "usher stopped" "port ${port}"
+        stop_server "$port"
     done
 }
 
@@ -300,106 +333,137 @@ status() {
         echo "usher is not running."
         return
     fi
-    local port state_file root pid
+    local port state_file root caddy_pid
     for port in "${ports[@]}"; do
-        pid="$(< "${RUN_DIR}/usher-${port}.pid")"
         state_file="${RUN_DIR}/state-${port}.json"
-        root=""
-        [[ -f "$state_file" ]] && root="$(jq -r '.root' "$state_file")"
-        printf 'usher running  https://127.0.0.1:%s  %s  (PID %s)\n' \
-            "$port" "${root:-?}" "$pid"
+        root=""; caddy_pid=0
+        if [[ -f "$state_file" ]]; then
+            root="$(jq -r '.root' "$state_file")"
+            caddy_pid="$(jq -r '.caddy_pid // 0' "$state_file")"
+        fi
+        printf 'usher running  https://127.0.0.1:%s  %s  (Caddy PID %s)\n' \
+            "$port" "${root:-?}" "$caddy_pid"
     done
 }
 
 gui_panel() {
     command -v zenity >/dev/null 2>&1 || { notify "usher" "zenity is required for the GUI panel."; exit 1; }
 
-    local -a running_ports
-    mapfile -t running_ports < <(list_running 2>/dev/null || true)
+    local -a running_ports items
+    local status_text port state_file rdir n choice bm_name display_name
 
-    local status_text items=()
+    while true; do
+        running_ports=()
+        items=()
+        mapfile -t running_ports < <(list_running 2>/dev/null || true)
 
-    if [[ ${#running_ports[@]} -gt 0 ]]; then
-        if [[ ${#running_ports[@]} -eq 1 ]]; then
-            local port="${running_ports[0]}"
-            local state_file="${RUN_DIR}/state-${port}.json"
-            local rdir; rdir="$(jq -r '.root' "$state_file" 2>/dev/null || echo '?')"
-            status_text="Running: https://127.0.0.1:${port}\n${rdir}"
+        if [[ ${#running_ports[@]} -gt 0 ]]; then
+            if [[ ${#running_ports[@]} -eq 1 ]]; then
+                port="${running_ports[0]}"
+                state_file="${RUN_DIR}/state-${port}.json"
+                rdir="$(jq -r '.root' "$state_file" 2>/dev/null || echo '?')"
+                status_text="Running: https://127.0.0.1:${port}\n${rdir}"
+            else
+                status_text="${#running_ports[@]} servers running"
+            fi
+            for port in "${running_ports[@]}"; do
+                rdir="$(jq -r '.root' "${RUN_DIR}/state-${port}.json" 2>/dev/null || echo '')"
+                bm_name="$(grep -F "=${rdir}" "$BOOKMARKS_FILE" 2>/dev/null | head -1 | cut -d= -f1 || true)"
+                display_name="${bm_name:-${rdir##*/}}"
+                items+=("Stop :${port} [${display_name}]")
+            done
         else
-            status_text="${#running_ports[@]} servers running"
+            status_text="Server is not running."
+            [[ -n "${DEFAULT_ROOT:-}" ]] && items+=("Serve: ${DEFAULT_ROOT##*/}")
+            if [[ -f "$BOOKMARKS_FILE" ]]; then
+                while IFS='=' read -r name _; do
+                    [[ -n "$name" ]] && items+=("$name")
+                done < <(grep "^[^#=]" "$BOOKMARKS_FILE")
+            fi
+            items+=("Serve a folder…")
         fi
-        for port in "${running_ports[@]}"; do
-            items+=("Stop :${port}")
-        done
-    else
-        status_text="Server is not running."
-        [[ -n "${DEFAULT_ROOT:-}" ]] && items+=("Serve: ${DEFAULT_ROOT##*/}")
-        if [[ -f "$BOOKMARKS_FILE" ]] && grep -q "^[^#]" "$BOOKMARKS_FILE"; then
-            while IFS='=' read -r name _; do
-                items+=("$name")
-            done < <(grep "^[^#]" "$BOOKMARKS_FILE")
-        fi
-        items+=("Serve a folder…")
-    fi
-    items+=("Add bookmark…" "Set default folder…")
+        items+=("Add bookmark…" "Remove bookmark…" "Set default folder…")
 
-    local n=${#items[@]} choice
-    choice=$(zenity --list \
-        --title="usher" \
-        --text="$status_text" \
-        --column="Action" \
-        --hide-header \
-        --width=300 \
-        --height=$(( 110 + n * 36 )) \
-        "${items[@]}" 2>/dev/null) || return 0
-    [[ -z "$choice" ]] && return 0
+        n=${#items[@]}
+        choice=$(zenity --list \
+            --title="usher" \
+            --text="$status_text" \
+            --column="──────────────────" \
+            --width=300 \
+            --height=$(( 250 + n * 65 )) \
+            "${items[@]}" 2>/dev/null) || return 0
+        [[ -z "$choice" ]] && return 0
 
-    case "$choice" in
-        "Stop :"*)
-            stop_server "${choice#Stop :}" ;;
-        "Serve: "*)
-            serve "$DEFAULT_ROOT" & ;;
-        "Serve a folder…")
-            local dir
-            dir="$(pick_dir)" || return 0
-            [[ -n "$dir" ]] && serve "$dir" & ;;
-        "Add bookmark…")
-            new_bookmark ;;
-        "Set default folder…")
-            set_default ;;
-        *)
-            local bm_path
-            bm_path="$(lookup_bookmark "$choice")" || { notify "usher" "Unknown bookmark: $choice"; return 1; }
-            serve "$bm_path" & ;;
-    esac
+        case "$choice" in
+            "Stop :"*)
+                local _p="${choice#Stop :}"; stop_server "${_p%% *}" ;;
+            "Serve: "*)
+                serve "$DEFAULT_ROOT" &
+                return 0 ;;
+            "Serve a folder…")
+                local dir
+                dir="$(pick_dir)" || continue
+                if [[ -n "$dir" ]]; then
+                    serve "$dir" &
+                    return 0
+                fi ;;
+            "Add bookmark…")
+                new_bookmark ;;
+            "Remove bookmark…")
+                remove_bookmark_gui ;;
+            "Set default folder…")
+                set_default ;;
+            *)
+                local bm_path
+                bm_path="$(lookup_bookmark "$choice")" || { notify "usher" "Unknown bookmark: $choice"; continue; }
+                serve "$bm_path" &
+                return 0 ;;
+        esac
+    done
 }
 
 install_extension() {
+    local uuid="usher@gtnewton.github.com"
     local src="${DATA_DIR}/extension"
-    local dest="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/usher@gtnewton.github.com"
+    local dest="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/${uuid}"
     if [[ ! -d "$src" ]]; then
         echo "usher: extension source not found at ${src}." >&2
         echo "       Re-run install.sh from the usher repository to install it." >&2
         exit 1
     fi
+    # Remove then re-create so the shell's directory monitor fires for a new entry.
+    rm -rf "$dest"
     mkdir -p "$dest"
     cp -r "${src}/." "$dest/"
+    if [[ -d "${dest}/schemas" ]] && command -v glib-compile-schemas >/dev/null 2>&1; then
+        glib-compile-schemas "${dest}/schemas"
+    fi
     echo "Extension installed to ${dest}"
     if command -v gnome-extensions >/dev/null 2>&1; then
-        gnome-extensions enable "usher@gtnewton.github.com" 2>/dev/null \
-            && echo "Extension enabled — it will appear in the top bar shortly." \
-            || echo "Enable manually: gnome-extensions enable usher@gtnewton.github.com"
+        local i
+        for i in $(seq 1 20); do
+            gnome-extensions list 2>/dev/null | grep -qx "$uuid" && break
+            sleep 0.25
+        done
+        if gnome-extensions enable "$uuid" 2>/dev/null; then
+            echo "Extension enabled — it will appear in the top bar shortly."
+        else
+            echo "Extension installed. Log out and back in to activate it,"
+            echo "or run: gnome-extensions enable ${uuid}"
+        fi
     else
-        echo "Enable with: gnome-extensions enable usher@gtnewton.github.com"
+        echo "Extension installed. Log out and back in to activate it."
     fi
 }
 
 uninstall_extension() {
-    local dest="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/usher@gtnewton.github.com"
+    local uuid="usher@gtnewton.github.com"
     if command -v gnome-extensions >/dev/null 2>&1; then
-        gnome-extensions disable "usher@gtnewton.github.com" 2>/dev/null || true
+        gnome-extensions uninstall "$uuid" 2>/dev/null \
+            && echo "Extension removed." \
+            && return
     fi
-    rm -rf "$dest"
+    rm -rf "${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/${uuid}"
     echo "Extension removed."
 }
 
@@ -597,7 +661,7 @@ EOF
     # parent shell that is about to exit, so the PID file would point at a dead
     # process and --stop/--status would lose track of the server.
     echo "$BASHPID" > "${RUN_DIR}/usher-${PORT}.pid"
-    write_state running "$root" "$PORT"
+    write_state running "$root" "$PORT" "$CADDY_PID"
     local count; count=$(list_running 2>/dev/null | wc -l) || count=0
     launcher_badge "$count"
     wait "$CADDY_PID"
