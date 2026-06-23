@@ -15,7 +15,12 @@
 
 .usher-count-label {
     padding: 0 2px;
+    min-width: 8px;
+    font-size: 13px;
     font-weight: bold;
+    /* St theme nodes don't reliably inherit `color`; set it explicitly or the
+       digit renders in the default (dark) colour and vanishes on the panel. */
+    color: #ff3333;
 }
 
 .usher-link-icon {

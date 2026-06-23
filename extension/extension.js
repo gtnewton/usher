@@ -1,6 +1,8 @@
+import Clutter from 'gi://Clutter';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Gio from 'gi://Gio';
+import Pango from 'gi://Pango';
 import St from 'gi://St';
 
 import { Extension } from 'resource:///org/gnome/shell/extensions/extension.js';
@@ -31,8 +33,11 @@ class extends PanelMenu.Button {
             text: '',
             style_class: 'usher-count-label',
             y_expand: true,
-            y_align: 1, // FILL
+            y_align: Clutter.ActorAlign.CENTER,
         });
+        // Never ellipsize the count — a single digit must always be readable,
+        // even in a cramped (e.g. nested-shell) top bar.
+        this._countLabel.clutter_text.ellipsize = Pango.EllipsizeMode.NONE;
         box.add_child(this._icon);
         box.add_child(this._countLabel);
         this.add_child(box);
