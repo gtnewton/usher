@@ -15,3 +15,9 @@ Thumbs.db
 
 # Claude Code machine-local settings
 .claude/settings.local.json
+
+# Compiled GSettings schema (build output of glib-compile-schemas)
+extension/schemas/gschemas.compiled
+
+# Local user data, not source
+/bookmarks
