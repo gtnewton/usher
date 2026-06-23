@@ -138,7 +138,7 @@ class extends PanelMenu.Button {
 
         this.menu.addMenuItem(new PopupMenu.PopupSeparatorMenuItem());
         const panelItem = new PopupMenu.PopupMenuItem('Open control panel');
-        panelItem.connect('activate', () => this._run([]));
+        panelItem.connect('activate', () => this._run(['--panel']));
         this.menu.addMenuItem(panelItem);
     }
 

@@ -15,6 +15,7 @@
 #   usher --bookmarks                List all bookmarks.
 #   usher --stop [PORT]              Stop a background server (all if no PORT given).
 #   usher --status                   Report all running background servers.
+#   usher --panel                    Open the graphical control panel.
 #   usher install-extension          Install the GNOME Shell top-bar extension.
 #   usher uninstall-extension        Remove the GNOME Shell top-bar extension.
 #   usher -h | --help                Show this help.
@@ -59,7 +60,7 @@ PHP_PID_FILE=""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 usage() {
-    sed -n '3,27p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 notify() {
@@ -350,39 +351,56 @@ gui_panel() {
     command -v zenity >/dev/null 2>&1 || { notify "usher" "zenity is required for the GUI panel."; exit 1; }
 
     local -a running_ports items
-    local status_text port state_file rdir n choice bm_name display_name
+    local status_text port rdir n choice bm_name display_name name path
 
     while true; do
         running_ports=()
         items=()
         mapfile -t running_ports < <(list_running 2>/dev/null || true)
 
-        if [[ ${#running_ports[@]} -gt 0 ]]; then
-            if [[ ${#running_ports[@]} -eq 1 ]]; then
-                port="${running_ports[0]}"
-                state_file="${RUN_DIR}/state-${port}.json"
-                rdir="$(jq -r '.root' "$state_file" 2>/dev/null || echo '?')"
-                status_text="Running: https://127.0.0.1:${port}\n${rdir}"
-            else
-                status_text="${#running_ports[@]} servers running"
-            fi
-            for port in "${running_ports[@]}"; do
-                rdir="$(jq -r '.root' "${RUN_DIR}/state-${port}.json" 2>/dev/null || echo '')"
-                bm_name="$(grep -F "=${rdir}" "$BOOKMARKS_FILE" 2>/dev/null | head -1 | cut -d= -f1 || true)"
-                display_name="${bm_name:-${rdir##*/}}"
-                items+=("Stop :${port} [${display_name}]")
-            done
+        # Status line.
+        if [[ ${#running_ports[@]} -eq 0 ]]; then
+            status_text="No servers running."
+        elif [[ ${#running_ports[@]} -eq 1 ]]; then
+            port="${running_ports[0]}"
+            rdir="$(jq -r '.root' "${RUN_DIR}/state-${port}.json" 2>/dev/null || echo '?')"
+            status_text="Running: https://127.0.0.1:${port}\n${rdir}"
         else
-            status_text="Server is not running."
-            [[ -n "${DEFAULT_ROOT:-}" ]] && items+=("Serve: ${DEFAULT_ROOT##*/}")
-            if [[ -f "$BOOKMARKS_FILE" ]]; then
-                while IFS='=' read -r name _; do
-                    [[ -n "$name" ]] && items+=("$name")
-                done < <(grep "^[^#=]" "$BOOKMARKS_FILE")
-            fi
-            items+=("Serve a folder…")
+            status_text="${#running_ports[@]} servers running"
         fi
-        items+=("Add bookmark…" "Remove bookmark…" "Set default folder…")
+
+        # Roots currently being served — so we don't offer to launch a bookmark
+        # (or the default) that is already running.
+        local -A running_roots=()
+        for port in "${running_ports[@]}"; do
+            rdir="$(jq -r '.root' "${RUN_DIR}/state-${port}.json" 2>/dev/null || echo '')"
+            [[ -n "$rdir" ]] && running_roots["$rdir"]=1
+        done
+
+        # Stop actions for each running server.
+        for port in "${running_ports[@]}"; do
+            rdir="$(jq -r '.root' "${RUN_DIR}/state-${port}.json" 2>/dev/null || echo '')"
+            bm_name="$(grep -F "=${rdir}" "$BOOKMARKS_FILE" 2>/dev/null | head -1 | cut -d= -f1 || true)"
+            display_name="${bm_name:-${rdir##*/}}"
+            items+=("Stop :${port} [${display_name}]")
+        done
+
+        # Launchable bookmarks (skip any already running) — always offered, so a
+        # running server doesn't hide the rest of the multi-instance options.
+        if [[ -f "$BOOKMARKS_FILE" ]]; then
+            while IFS='=' read -r name path; do
+                [[ -z "$name" ]] && continue
+                [[ -n "${running_roots[$path]:-}" ]] && continue
+                items+=("$name")
+            done < <(grep "^[^#=]" "$BOOKMARKS_FILE")
+        fi
+
+        # Serve the default root, unless it is already running.
+        if [[ -n "${DEFAULT_ROOT:-}" && -z "${running_roots[$DEFAULT_ROOT]:-}" ]]; then
+            items+=("Serve: ${DEFAULT_ROOT##*/}")
+        fi
+
+        items+=("Serve a folder…" "Add bookmark…" "Remove bookmark…" "Set default folder…")
 
         n=${#items[@]}
         choice=$(zenity --list \
@@ -684,6 +702,7 @@ main() {
         -h|--help)      usage; exit 0 ;;
         --stop)         stop_server "${2:-}"; exit 0 ;;
         --status)       status; exit 0 ;;
+        --panel)        gui_panel; exit 0 ;;
         --set-default)  set_default "${2:-}"; exit 0 ;;
         --pick)         root="$(pick_dir)" || exit 0; [[ -z "$root" ]] && exit 0 ;;
         --new-bookmark) new_bookmark; exit 0 ;;
