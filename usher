@@ -18,6 +18,8 @@
 #   usher --panel                    Open the graphical control panel.
 #   usher install-extension          Install the GNOME Shell top-bar extension.
 #   usher uninstall-extension        Remove the GNOME Shell top-bar extension.
+#   usher dev-link                   Symlink the installed extension to this repo
+#                                    checkout (for extension development).
 #   usher -h | --help                Show this help.
 #
 # To serve a local subdirectory that shares a name with a bookmark, use ./name.
@@ -60,7 +62,7 @@ PHP_PID_FILE=""
 # ── Helpers ──────────────────────────────────────────────────────────────────
 
 usage() {
-    sed -n '3,28p' "$0" | sed 's/^# \{0,1\}//'
+    sed -n '3,30p' "$0" | sed 's/^# \{0,1\}//'
 }
 
 notify() {
@@ -485,6 +487,57 @@ uninstall_extension() {
     echo "Extension removed."
 }
 
+# Symlink the installed extension straight at this repo's extension/ dir, so
+# edits are live without a copy step. Wayland still requires a shell reload
+# (log out/in, or a nested shell) before changes take effect in the session.
+dev_link() {
+    local uuid="usher@gtnewton.github.com"
+    local repo_usher script_dir repo_ext dest bin_dest
+    repo_usher="$(readlink -f "${BASH_SOURCE[0]}")"
+    script_dir="$(cd "$(dirname "$repo_usher")" && pwd)"
+    repo_ext="${script_dir}/extension"
+    dest="${XDG_DATA_HOME:-$HOME/.local/share}/gnome-shell/extensions/${uuid}"
+    bin_dest="${HOME}/.local/bin/usher"
+
+    if [[ ! -d "$repo_ext" ]]; then
+        echo "usher: no extension/ dir beside this script (${repo_ext})." >&2
+        echo "       Run 'usher dev-link' from a checked-out usher repository." >&2
+        exit 1
+    fi
+
+    # Point the on-PATH usher at this checkout, so the extension (and the shell)
+    # run the repo script directly. Skip if we are already that symlink's target.
+    if [[ "$(readlink -f "$bin_dest" 2>/dev/null)" != "$repo_usher" ]]; then
+        mkdir -p "$(dirname "$bin_dest")"
+        ln -sf "$repo_usher" "$bin_dest"
+        echo "Dev-linked ${bin_dest}"
+        echo "        -> ${repo_usher}"
+    fi
+
+    # Compile the GSettings schema in place so prefs.js / getSettings() work.
+    if [[ -d "${repo_ext}/schemas" ]] && command -v glib-compile-schemas >/dev/null 2>&1; then
+        glib-compile-schemas "${repo_ext}/schemas"
+    fi
+
+    rm -rf "$dest"
+    ln -s "$repo_ext" "$dest"
+    echo "Dev-linked ${dest}"
+    echo "        -> ${repo_ext}"
+
+    if command -v gnome-extensions >/dev/null 2>&1; then
+        gnome-extensions enable "$uuid" 2>/dev/null || true
+    fi
+
+    echo
+    echo "The on-PATH 'usher' command now runs this checkout too — script edits"
+    echo "take effect on the next invocation, no reinstall."
+    echo "Edits in the repo are now live for the extension (no reinstall needed)."
+    echo "Wayland note: the running shell will not hot-reload. To test an edit"
+    echo "without logging out, run a nested shell:"
+    echo "    dbus-run-session -- gnome-shell --nested --wayland"
+    echo "Your main session picks up changes only after log out / in."
+}
+
 cleanup() {
     [[ -n "$CADDY_PID" ]] && kill "$CADDY_PID" 2>/dev/null || true
     [[ -n "$PHP_PID_FILE" && -f "$PHP_PID_FILE" ]] && kill "$(cat "$PHP_PID_FILE")" 2>/dev/null || true
@@ -711,6 +764,7 @@ main() {
         --bookmarks)           list_bookmarks; exit 0 ;;
         install-extension)   install_extension; exit 0 ;;
         uninstall-extension) uninstall_extension; exit 0 ;;
+        dev-link)            dev_link; exit 0 ;;
         -*)             echo "usher: unknown option: $1" >&2; usage; exit 1 ;;
         "")
             if [[ -t 1 ]]; then
