@@ -35,13 +35,49 @@ if [[ -d "$EXTENSION_DIR" ]]; then
     fi
 fi
 
+BOOKMARKS_FILE="${CONFIG_DIR}/bookmarks"
+
 if [[ -d "$DATA_DIR" || -d "$CONFIG_DIR" ]]; then
     echo
     read -rp "Also remove the certificate and config (${DATA_DIR}, ${CONFIG_DIR})? [y/N] " choice
     case "$choice" in
         [yY]|[yY][eE][sS])
-            [[ -d "$DATA_DIR" ]]   && rm -rf "$DATA_DIR"   && echo "Removed $DATA_DIR"
-            [[ -d "$CONFIG_DIR" ]] && rm -rf "$CONFIG_DIR" && echo "Removed $CONFIG_DIR"
+            [[ -d "$DATA_DIR" ]] && rm -rf "$DATA_DIR" && echo "Removed $DATA_DIR"
+
+            if [[ -d "$CONFIG_DIR" ]]; then
+                # Bookmarks are user data, not an installed artifact — decide
+                # their fate separately before wiping the config directory.
+                keep_bookmarks=0
+                if [[ -f "$BOOKMARKS_FILE" ]]; then
+                    echo
+                    echo "You have saved bookmarks at $BOOKMARKS_FILE"
+                    read -rp "Bookmarks: [k]eep (default), [b]ack up to home, or [d]elete with config? [K/b/d] " bm_choice
+                    case "$bm_choice" in
+                        [bB])
+                            backup="${HOME}/usher-bookmarks-$(date +%Y%m%d-%H%M%S).bak"
+                            cp -p "$BOOKMARKS_FILE" "$backup"
+                            echo "Backed up bookmarks to $backup"
+                            ;;
+                        [dD])
+                            echo "Bookmarks will be deleted with the config."
+                            ;;
+                        *)
+                            keep_bookmarks=1
+                            ;;
+                    esac
+                fi
+
+                if [[ "$keep_bookmarks" == 1 ]]; then
+                    saved="$(mktemp)"
+                    cp -p "$BOOKMARKS_FILE" "$saved"
+                    rm -rf "$CONFIG_DIR"
+                    mkdir -p "$CONFIG_DIR"
+                    mv "$saved" "$BOOKMARKS_FILE"
+                    echo "Removed $CONFIG_DIR (kept bookmarks)"
+                else
+                    rm -rf "$CONFIG_DIR" && echo "Removed $CONFIG_DIR"
+                fi
+            fi
             ;;
         *)
             echo "Left certificate and config in place."
